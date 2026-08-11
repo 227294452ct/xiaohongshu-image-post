@@ -6,7 +6,7 @@ version: 1.0.0
 
 # 小红书图文自动发布（Edge CDP）
 
-适用场景：用户要求"发小红书/发布笔记/小红书图文"。通过 Edge CDP 自动化发布小红书图文笔记（creator.xiaohongshu.com）：上传图片、填标题正文、话题自动识别、发布、三层登录防线（profile 复用/静默继承/扫码回退）。**2026-08 已实测全链路**（上传/填表/话题/字数计数），发布确认弹窗与成功标志待首次真实发布时确认。
+适用场景：用户要求"发小红书/发布笔记/小红书图文"。通过 Edge CDP 自动化发布小红书图文笔记（creator.xiaohongshu.com）：上传图片、填标题正文、话题自动识别、发布、三层登录防线（profile 复用/静默继承/扫码回退）。**2026-08-12 已实测发布成功 2 条**（手动 1 条 + 自动化 1 条）：上传/填表/发布/成功验证全链路打通。
 
 ## 前提
 
@@ -52,7 +52,8 @@ Invoke-RestMethod http://127.0.0.1:9223/json/version | Select-Object Browser,web
 写配置 `C:\temp\xhs_config.json`：`{files:[Windows原生绝对路径...], title, body, shotDir}`，然后
 `CDP_PORT=9223 node "<skill目录>/publish_template.js" C:\temp\xhs_config.json`
 
-脚本内部流程（已实测 1-8）：
+脚本内部流程（**已实测全链路，2026-08-12 发布成功**）：
+0. **开全新 tab**（`PUT /json/new`）：旧 tab 经多次注入/重置后 React 状态会坏——发布按钮不渲染，导致 NO_BTN 假象。**每次发布必须新 tab**（实测教训）
 1. 导航 `/publish/publish`；若登录页则中止（先跑 login_check）
 2. 点"上传图文"tab：叶子元素（`children.length===0`）文本精确匹配 `上传图文`，取可见者按 y 排序第一个 click（哈希 class 名每次发版会变，只用文本）
 3. `DOM.enable` → `DOM.getDocument` → `DOM.querySelector` 找 `input[type=file]`（accept=.jpg,.jpeg,.png,.webp）→ `DOM.setFileInputFiles` 一次注入全部图片
@@ -60,8 +61,8 @@ Invoke-RestMethod http://127.0.0.1:9223/json/version | Select-Object Browser,web
 5. 等上传完成：placeholder"填写标题会有更多赞哦"的 input 出现即表单就绪（约 10~15s，轮询超时 abort）
 6. 标题：`HTMLInputElement.prototype` 的 value setter + `input` 事件（semi 受控组件）；**硬限 20 字**，长标题必须缩短
 7. 正文：`[contenteditable=true]`（tiptap ProseMirror）focus + `document.execCommand('insertText', false, body)`；**实测 ProseMirror 接受 execCommand**；字数 UI `N/1000` 实时更新；#话题 在正文里直接写会被自动识别为话题标签
-8. 发布前截图留档；点"发布笔记"（若弹确认对话框含"发布"再点一次——待真实发布确认）
-9. 成功标志（待确认）：URL 跳转 /publish/success 或笔记管理列表出现新笔记；轮询 30s
+8. **点"发布"按钮（`<button class="ce-btn bg-red">发布</button>`，右下角）**：首选 **CDP Accessibility 方案**（实测最可靠）——`Accessibility.getFullAXTree` 找 `role==='button' && name==='发布'` → `backendDOMNodeId` → `DOM.resolveNode` → `Runtime.callFunctionOn` click；兜底 DOM 文本匹配（textContent==='发布' 且宽<300，x 最右）。**注意区分**：侧边栏顶部红色"发布笔记"是导航入口（点击跳视频页+重置表单），不是发布按钮
+9. **成功标志（实测）**：URL 跳转 `/publish/success` + 页面出现"发布成功"，3 秒后自动返回发布页（`published=true`）；轮询 60s
 
 ### 4. 收尾
 
@@ -79,6 +80,8 @@ Invoke-RestMethod http://127.0.0.1:9223/json/version | Select-Object Browser,web
 - 发布频率别太高（小红书风控较敏感），定时发布功能可做人工兜底
 - Edge 136+：默认 profile 禁 remote-debugging-port，独立 user-data-dir 是唯一通路
 - 页面偶发卡死（渲染进程忙）：`PUT /json/new?<url>` 开新 tab 绕开，别在原 tab 死等
+- **旧 tab 状态污染**：同一 tab 反复注入/导航后发布按钮会消失（React 状态坏），表现为"表单完整但无发布按钮"——每次发布流程必须开全新 tab
+- **发布按钮定位用 CDP Accessibility 树**（`getFullAXTree` 找 role=button name=发布）最可靠；视觉模型（LLM 看图）会脑补不存在的按钮，DOM 诊断别信截图描述，用 OCR 或 AX 树验证
 
 ## Verification
 

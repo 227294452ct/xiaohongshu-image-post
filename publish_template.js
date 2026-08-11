@@ -11,11 +11,23 @@ const TITLE_LIMIT = 20;
 const BODY_LIMIT = 1000;
 
 (async () => {
+  // 校验
+  if (CFG.title.length > TITLE_LIMIT) throw new Error('title too long: ' + CFG.title.length + ' > ' + TITLE_LIMIT);
+  if (CFG.body.length > BODY_LIMIT) throw new Error('body too long: ' + CFG.body.length + ' > ' + BODY_LIMIT);
+  CFG.files.forEach((f) => { if (!fs.existsSync(f)) throw new Error('file not found: ' + f); });
+
+  // 0. 开全新 tab（旧 tab 经多次注入/重置后 React 状态会坏：发布按钮不渲染！
+  //    实测教训：在旧 tab 上重跑会导致 NO_BTN 假象。每次发布必须新 tab）
+  await fetch('http://127.0.0.1:' + (process.env.CDP_PORT || '9222') + '/json/new?https://creator.xiaohongshu.com/publish/publish', { method: 'PUT' });
+  await sleep(9000);
+
+  // 1. 导航 + 登录检查（连到最新 tab）
   const target = await getPageTarget('xiaohongshu');
   const cdp = await connectTo(target);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
   await cdp.send('DOM.enable');
+  await cdp.send('Accessibility.enable');
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1400, height: 950, deviceScaleFactor: 1, mobile: false });
   const ev = (expr) => cdp.send('Runtime.evaluate', { expression: expr, returnByValue: true, timeout: 15000 });
   const shot = async (name) => {
@@ -25,12 +37,6 @@ const BODY_LIMIT = 1000;
     console.log('screenshot:', name + '.png');
   };
 
-  // 校验
-  if (CFG.title.length > TITLE_LIMIT) throw new Error('title too long: ' + CFG.title.length + ' > ' + TITLE_LIMIT);
-  if (CFG.body.length > BODY_LIMIT) throw new Error('body too long: ' + CFG.body.length + ' > ' + BODY_LIMIT);
-  CFG.files.forEach((f) => { if (!fs.existsSync(f)) throw new Error('file not found: ' + f); });
-
-  // 1. 导航 + 登录检查
   await cdp.send('Page.navigate', { url: PUBLISH_URL });
   await sleep(8000);
   const loginState = await ev(`document.body.innerText.includes('短信登录') ? 'LOGIN_PAGE' : 'OK'`);
@@ -101,36 +107,64 @@ const BODY_LIMIT = 1000;
   console.log('VERIFY:', verify.result.value);
   await shot('before_publish');
 
-  // 8. 点"发布笔记"（若弹确认对话框，点含"发布"的按钮）
-  const pubRes = await ev(`(() => {
-    const btn = [...document.querySelectorAll('*')].find(e =>
-      e.children.length === 0 && e.textContent.trim() === '发布笔记' && e.getBoundingClientRect().width > 0);
-    if (!btn) return 'NO_BTN';
-    btn.click();
-    return 'CLICKED';
-  })()`);
-  console.log('publish click:', pubRes.result.value);
-  await sleep(3000);
+  // 8. 点"发布"按钮（<button class="ce-btn bg-red">发布</button>，右下角）
+  //    首选 AX 树方案（实测最可靠）：Accessibility.getFullAXTree 找 role=button && name='发布'
+  //    → backendDOMNodeId → DOM.resolveNode → callFunctionOn click
+  let pubClicked = false;
+  try {
+    const ax = await cdp.send('Accessibility.getFullAXTree', {});
+    const pubNode = ax.nodes.find(n => n.role && n.role.value === 'button' && n.name && n.name.value === '发布');
+    if (pubNode && pubNode.backendDOMNodeId) {
+      const res = await cdp.send('DOM.resolveNode', { backendNodeId: pubNode.backendDOMNodeId });
+      const objId = res.object.objectId;
+      await cdp.send('Runtime.callFunctionOn', {
+        objectId: objId,
+        functionDeclaration: `function() { this.click(); return 'CLICKED'; }`,
+        returnByValue: true
+      });
+      pubClicked = true;
+      console.log('publish click: AX_CLICKED (nodeId=' + pubNode.nodeId + ')');
+    }
+  } catch (e) {
+    console.log('AX lookup failed:', e.message.slice(0, 60));
+  }
+  if (!pubClicked) {
+    // 兜底：DOM 文本匹配（新 tab 下按钮 textContent 就是"发布"，x 最右）
+    const pubRes = await ev(`(() => {
+      const cands = [...document.querySelectorAll('*')].filter(e => {
+        const r = e.getBoundingClientRect();
+        return e.textContent.trim() === '发布' && r.width > 0 && r.height > 0 && r.width < 300;
+      });
+      if (!cands.length) return 'NO_BTN';
+      cands.sort((a, b) => b.getBoundingClientRect().x - a.getBoundingClientRect().x);
+      cands[0].click();
+      return 'CLICKED';
+    })()`);
+    console.log('publish click:', pubRes.result.value);
+  }
+  await sleep(4000);
 
-  // 弹窗确认（如有）
+  // 弹窗确认（若有）：只在 modal/dialog 容器内找"确认发布/发布"按钮
   const confirmRes = await ev(`(() => {
-    const t = document.body.innerText;
-    if (!/确认发布|发布笔记/.test(t.slice(0, 500))) return 'NO_DIALOG';
-    const btn = [...document.querySelectorAll('*')].find(e =>
-      e.children.length === 0 && /^(确认发布|发布|确定)$/.test(e.textContent.trim()) && e.getBoundingClientRect().width > 0);
-    if (btn) { btn.click(); return 'CONFIRMED'; }
-    return 'DIALOG_NO_BTN';
+    const modals = [...document.querySelectorAll('[role=dialog], [class*=modal i], [class*=dialog i]')]
+      .filter(m => { const r = m.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+    if (!modals.length) return 'NO_MODAL';
+    const btn = [...modals[0].querySelectorAll('*')].find(e =>
+      e.children.length === 0 && /^(确认发布|发布|确定)$/.test(e.textContent.trim()));
+    if (!btn) return 'MODAL_NO_BTN:' + modals[0].innerText.slice(0, 100);
+    btn.click();
+    return 'CONFIRMED';
   })()`);
   console.log('confirm:', confirmRes.result.value);
   await shot('after_publish');
 
-  // 9. 成功轮询：URL 离开 publish 页 或 出现"发布成功"
+  // 9. 成功轮询：URL 跳 /publish/success 或出现"发布成功"（实测标志）
   let done = false;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 12; i++) {
     await sleep(5000);
-    const r = await ev(`JSON.stringify({url: location.href, hasSuccess: /发布成功|发布完成/.test(document.body.innerText.slice(0, 800))})`);
+    const r = await ev(`JSON.stringify({url: location.href, hasSuccess: /发布成功/.test(document.body.innerText.slice(0, 800))})`);
     const s = JSON.parse(r.result.value);
-    if (s.hasSuccess || !s.url.includes('/publish/publish')) { done = true; console.log('PUBLISH DONE:', s.url); break; }
+    if (s.hasSuccess || s.url.includes('/publish/success')) { done = true; console.log('PUBLISH DONE:', s.url); break; }
   }
   if (!done) console.warn('publish result unverified - check 笔记管理 manually');
   cdp.close();
